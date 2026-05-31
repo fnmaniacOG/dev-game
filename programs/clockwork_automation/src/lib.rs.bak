@@ -1,0 +1,324 @@
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+
+declare_id!("ClockAuto111111111111111111111111111111111111");
+
+// ─── NOTE ─────────────────────────────────────────────────────────────────────
+// Clockwork (formerly Thread) was sunset. This program implements the same
+// automation logic but triggered by Helius webhooks or a simple cron job.
+// Each instruction is idempotent and can be called by any authorized keeper.
+//
+// For production, deploy a simple Helius webhook that calls these instructions
+// on a schedule, or use a small keeper bot that runs on any VPS.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const PROTOCOL_FEE_BPS: u64     = 200;   // 2% of game revenue
+pub const PLAYER_FEE_SHARE_BPS: u64 = 8_000; // 80% of fees → player rewards
+pub const TREASURY_FEE_SHARE_BPS: u64 = 2_000; // 20% → treasury
+pub const LOW_POOL_WARN_BPS: u64    = 1_000; // warn at 10% remaining
+pub const LOW_POOL_CRIT_BPS: u64    = 500;   // critical at 5% remaining
+pub const LP_WARN_DAYS_1: i64       = 30 * 24 * 60 * 60;
+pub const LP_WARN_DAYS_2: i64       = 7 * 24 * 60 * 60;
+pub const SWEEP_COOLDOWN: i64       = 24 * 60 * 60; // once per day
+
+#[error_code]
+pub enum AutomationError {
+    #[msg("Unauthorized keeper")]
+    Unauthorized,
+    #[msg("Sweep on cooldown")]
+    SweepOnCooldown,
+    #[msg("Tournament not ended")]
+    TournamentNotEnded,
+    #[msg("Already finalized")]
+    AlreadyFinalized,
+    #[msg("Arithmetic overflow")]
+    Overflow,
+}
+
+#[account]
+pub struct AutomationConfig {
+    pub authority:      Pubkey,
+    pub treasury:       Pubkey,
+    pub keepers:        [Pubkey; 10],
+    pub keeper_count:   u8,
+    pub last_sweep_at:  i64,
+    pub total_swept:    u64,
+    pub bump:           u8,
+}
+
+impl AutomationConfig {
+    pub const LEN: usize = 8 + 32 + 32 + 32 * 10 + 1 + 8 + 8 + 1; // up to 10 keepers
+}
+
+#[program]
+pub mod clockwork_automation {
+    use super::*;
+
+    /// Initialize automation config with authorized keepers.
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        keepers: Vec<Pubkey>,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        config.authority     = ctx.accounts.authority.key();
+        config.treasury      = ctx.accounts.treasury.key();
+        config.keeper_count = keepers.len().min(10) as u8;
+        for (i, k) in keepers.iter().take(10).enumerate() { config.keepers[i] = *k; }
+        config.last_sweep_at = 0;
+        config.total_swept   = 0;
+        config.bump          = ctx.bumps.config;
+        Ok(())
+    }
+
+    /// Daily fee sweep: collect protocol fees and split 80/20 player/treasury.
+    /// Callable by any registered keeper once per 24 hours.
+    pub fn execute_fee_sweep(ctx: Context<ExecuteFeeSweep>) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(
+            config.keepers[..config.keeper_count as usize].contains(&ctx.accounts.keeper.key()),
+            AutomationError::Unauthorized
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now >= config.last_sweep_at + SWEEP_COOLDOWN,
+            AutomationError::SweepOnCooldown
+        );
+
+        let fee_balance = ctx.accounts.fee_vault.amount;
+        if fee_balance == 0 {
+            return Ok(());
+        }
+
+        let player_share = fee_balance
+            .checked_mul(PLAYER_FEE_SHARE_BPS)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(AutomationError::Overflow)?;
+        let treasury_share = fee_balance
+            .checked_sub(player_share)
+            .ok_or(AutomationError::Overflow)?;
+
+        let fee_bump = ctx.accounts.fee_vault_bump.load()?.bump as u8;
+        let seeds: &[&[&[u8]]] = &[&[b"fee_vault", &[fee_bump]]];
+
+        if player_share > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from:      ctx.accounts.fee_vault.to_account_info(),
+                        to:        ctx.accounts.player_rewards_vault.to_account_info(),
+                        authority: ctx.accounts.fee_vault.to_account_info(),
+                    },
+                    seeds,
+                ),
+                player_share,
+            )?;
+        }
+
+        if treasury_share > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from:      ctx.accounts.fee_vault.to_account_info(),
+                        to:        ctx.accounts.treasury_vault.to_account_info(),
+                        authority: ctx.accounts.fee_vault.to_account_info(),
+                    },
+                    seeds,
+                ),
+                treasury_share,
+            )?;
+        }
+
+        let config = &mut ctx.accounts.config;
+        config.last_sweep_at = now;
+        config.total_swept   = config
+            .total_swept
+            .checked_add(fee_balance)
+            .ok_or(AutomationError::Overflow)?;
+
+        emit!(FeesSwept {
+            player_share,
+            treasury_share,
+            swept_at: now,
+        });
+
+        Ok(())
+    }
+
+    /// Check reward pool health and emit alerts.
+    /// Returns the health level so the keeper can decide whether to alert.
+    pub fn check_pool_health(ctx: Context<CheckPoolHealth>) -> Result<PoolHealthResult> {
+        let pool_balance    = ctx.accounts.reward_vault.amount;
+        let initial_balance = ctx.accounts.game_config.load()?.initial_reward_pool;
+
+        if initial_balance == 0 {
+            return Ok(PoolHealthResult { level: 100, alert: false });
+        }
+
+        let pct_bps = pool_balance
+            .checked_mul(10_000)
+            .and_then(|v| v.checked_div(initial_balance))
+            .ok_or(AutomationError::Overflow)?;
+
+        let (level, alert) = if pct_bps <= LOW_POOL_CRIT_BPS {
+            emit!(PoolAlert {
+                game:    ctx.accounts.game.key(),
+                level:   "critical".to_string(),
+                pct_bps,
+            });
+            (0u8, true)
+        } else if pct_bps <= LOW_POOL_WARN_BPS {
+            emit!(PoolAlert {
+                game:    ctx.accounts.game.key(),
+                level:   "warning".to_string(),
+                pct_bps,
+            });
+            (1u8, true)
+        } else {
+            (2u8, false)
+        };
+
+        Ok(PoolHealthResult { level, alert })
+    }
+
+    /// Emit LP lock expiry warning if within 30 or 7 days of unlock.
+    pub fn check_lp_expiry(ctx: Context<CheckLpExpiry>) -> Result<()> {
+        let unlock_at = ctx.accounts.lp_lock_config.load()?.unlock_at;
+        let now       = Clock::get()?.unix_timestamp;
+        let remaining = unlock_at.saturating_sub(now);
+
+        if remaining <= LP_WARN_DAYS_2 {
+            emit!(LpExpiryWarning {
+                creator:   ctx.accounts.creator.key(),
+                unlock_at,
+                days_left: (remaining / 86_400) as u8,
+                level:     "urgent".to_string(),
+            });
+        } else if remaining <= LP_WARN_DAYS_1 {
+            emit!(LpExpiryWarning {
+                creator:   ctx.accounts.creator.key(),
+                unlock_at,
+                days_left: (remaining / 86_400) as u8,
+                level:     "warning".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+// ─── Result types ─────────────────────────────────────────────────────────────
+
+#[derive(AnchorSerialize, AnchorDeserialize)]
+pub struct PoolHealthResult {
+    pub level: u8,   // 0=critical, 1=warning, 2=ok
+    pub alert: bool,
+}
+
+// ─── Zero-copy configs (for cross-program reads) ──────────────────────────────
+
+#[account(zero_copy)]
+pub struct GameConfig {
+    pub initial_reward_pool: u64,
+    pub unlock_at:           i64,
+}
+
+#[account(zero_copy)]
+pub struct LpLockConfig {
+    pub unlock_at: i64,
+}
+
+#[account(zero_copy)]
+pub struct FeeVaultBump {
+    pub bump: u64,
+}
+
+// ─── Account contexts ─────────────────────────────────────────────────────────
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = AutomationConfig::LEN,
+        seeds = [b"automation_config"],
+        bump,
+    )]
+    pub config: Account<'info, AutomationConfig>,
+
+    /// CHECK: treasury wallet
+    pub treasury: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteFeeSweep<'info> {
+    pub keeper: Signer<'info>,
+
+    #[account(mut, seeds = [b"automation_config"], bump = config.bump)]
+    pub config: Account<'info, AutomationConfig>,
+
+    #[account(mut)]
+    pub fee_vault: Account<'info, TokenAccount>,
+
+    pub fee_vault_bump: AccountLoader<'info, FeeVaultBump>,
+
+    #[account(mut)]
+    pub player_rewards_vault: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub treasury_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct CheckPoolHealth<'info> {
+    pub keeper: Signer<'info>,
+
+    /// CHECK: game account
+    pub game: UncheckedAccount<'info>,
+
+    pub game_config: AccountLoader<'info, GameConfig>,
+
+    pub reward_vault: Account<'info, TokenAccount>,
+}
+
+#[derive(Accounts)]
+pub struct CheckLpExpiry<'info> {
+    pub keeper: Signer<'info>,
+
+    pub creator: Signer<'info>,
+
+    pub lp_lock_config: AccountLoader<'info, LpLockConfig>,
+}
+
+// ─── Events ───────────────────────────────────────────────────────────────────
+
+#[event]
+pub struct FeesSwept {
+    pub player_share:   u64,
+    pub treasury_share: u64,
+    pub swept_at:       i64,
+}
+
+#[event]
+pub struct PoolAlert {
+    pub game:    Pubkey,
+    pub level:   u8,
+    pub pct_bps: u64,
+}
+
+#[event]
+pub struct LpExpiryWarning {
+    pub creator:   Pubkey,
+    pub unlock_at: i64,
+    pub days_left: u8,
+    pub level:     u8,
+}

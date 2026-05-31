@@ -1,0 +1,450 @@
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+
+declare_id!("Tourney111111111111111111111111111111111111");
+
+pub const MAX_ENTRANTS: u32      = 10_000;
+pub const MAX_PRIZE_SHARES: usize = 10;  // top-N prize distribution
+pub const MAX_NAME_LEN: usize    = 64;
+
+#[error_code]
+pub enum TourneyError {
+    #[msg("Tournament has not ended yet")]
+    NotEnded,
+    #[msg("Tournament has already ended")]
+    AlreadyEnded,
+    #[msg("Tournament is full")]
+    TournamentFull,
+    #[msg("Entry fee transfer failed")]
+    EntryFeeFailed,
+    #[msg("Prize already claimed")]
+    AlreadyClaimed,
+    #[msg("Prize shares must sum to 10,000 bps")]
+    PrizeSharesMismatch,
+    #[msg("Prize shares array too large")]
+    TooManyPrizeShares,
+    #[msg("Tournament not yet finalized")]
+    NotFinalized,
+    #[msg("Unauthorized")]
+    Unauthorized,
+    #[msg("Arithmetic overflow")]
+    Overflow,
+    #[msg("Rank not in prize positions")]
+    NoPrize,
+}
+
+#[account]
+pub struct Tournament {
+    pub creator:         Pubkey,
+    pub game:            Pubkey,
+    pub mint:            Pubkey,
+    pub prize_vault:     Pubkey,
+    pub name:            [u8; 64],       // max 64
+    pub entry_fee:       u64,
+    pub prize_pool:      u64,          // total tokens in vault
+    pub max_entrants:    u32,
+    pub current_entrants: u32,
+    pub start_ts:        i64,
+    pub end_ts:          i64,
+    pub is_finalized:    bool,
+    pub prize_shares:    [u16; 10],
+    pub num_prize_tiers: u8,
+    pub bump:            u8,
+    pub vault_bump:      u8,
+}
+
+impl Tournament {
+    pub const LEN: usize = 8
+        + 32 * 4     // creator, game, mint, prize_vault
+        + 64         // name [u8; 64]
+        + 8 + 8      // entry_fee, prize_pool
+        + 4 + 4      // max_entrants, current_entrants
+        + 8 + 8      // timestamps
+        + 1          // is_finalized
+        + 2 * 10     // prize_shares [u16; 10]
+        + 1          // num_prize_tiers
+        + 1 + 1;     // bumps
+}
+
+#[account]
+pub struct TournamentEntry {
+    pub player:       Pubkey,
+    pub tournament:   Pubkey,
+    pub score:        u64,
+    pub final_rank:   u32,    // 0 = unranked (before finalize)
+    pub claimed:      bool,
+    pub entered_at:   i64,
+    pub bump:         u8,
+}
+
+impl TournamentEntry {
+    pub const LEN: usize = 8 + 32 * 2 + 8 + 4 + 1 + 8 + 1;
+}
+
+#[program]
+pub mod tournament {
+    use super::*;
+
+    /// Create a new tournament with a pre-funded prize pool.
+    pub fn create_tournament(
+        ctx: Context<CreateTournament>,
+        params: CreateTournamentParams,
+    ) -> Result<()> {
+        require!(params.name.len() <= MAX_NAME_LEN, TourneyError::Overflow);
+        require!(
+            params.prize_shares.len() <= MAX_PRIZE_SHARES,
+            TourneyError::TooManyPrizeShares
+        );
+
+        // Validate prize shares sum to 10,000
+        let shares_sum: u32 = params.prize_shares.iter().map(|&s| s as u32).sum();
+        require!(shares_sum == 10_000, TourneyError::PrizeSharesMismatch);
+
+        // Transfer prize pool tokens from creator → vault
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from:      ctx.accounts.creator_token_account.to_account_info(),
+                    to:        ctx.accounts.prize_vault.to_account_info(),
+                    authority: ctx.accounts.creator.to_account_info(),
+                },
+            ),
+            params.prize_pool,
+        )?;
+
+        let t = &mut ctx.accounts.tournament;
+        t.creator          = ctx.accounts.creator.key();
+        t.game             = ctx.accounts.game.key();
+        t.mint             = ctx.accounts.mint.key();
+        t.prize_vault      = ctx.accounts.prize_vault.key();
+        let nb = params.name.as_bytes();
+        let nc = nb.len().min(64);
+        t.name[..nc].copy_from_slice(&nb[..nc]);
+        ...
+        let num = params.prize_shares.len().min(10);
+        t.prize_shares[..num].copy_from_slice(&params.prize_shares[..num]);
+        t.num_prize_tiers  = num as u8;
+        t.bump             = ctx.bumps.tournament;
+        t.vault_bump       = ctx.bumps.prize_vault;
+
+        emit!(TournamentCreated {
+            tournament: ctx.accounts.tournament.key(),
+            game:       ctx.accounts.game.key(),
+            prize_pool: params.prize_pool,
+        });
+
+        Ok(())
+    }
+
+    /// Enter a tournament by paying the entry fee.
+    pub fn enter_tournament(ctx: Context<EnterTournament>) -> Result<()> {
+        let t = &ctx.accounts.tournament;
+        let now = Clock::get()?.unix_timestamp;
+
+        require!(now < t.end_ts, TourneyError::AlreadyEnded);
+        require!(
+            t.current_entrants < t.max_entrants,
+            TourneyError::TournamentFull
+        );
+
+        // Pay entry fee
+        if t.entry_fee > 0 {
+            token::transfer(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from:      ctx.accounts.player_token_account.to_account_info(),
+                        to:        ctx.accounts.prize_vault.to_account_info(),
+                        authority: ctx.accounts.player.to_account_info(),
+                    },
+                ),
+                t.entry_fee,
+            )?;
+
+            let tournament = &mut ctx.accounts.tournament;
+            tournament.prize_pool = tournament
+                .prize_pool
+                .checked_add(t.entry_fee)
+                .ok_or(TourneyError::Overflow)?;
+        }
+
+        let entry = &mut ctx.accounts.entry;
+        entry.player     = ctx.accounts.player.key();
+        entry.tournament = ctx.accounts.tournament.key();
+        entry.score      = 0;
+        entry.final_rank = 0;
+        entry.claimed    = false;
+        entry.entered_at = Clock::get()?.unix_timestamp;
+        entry.bump       = ctx.bumps.entry;
+
+        ctx.accounts.tournament.current_entrants = ctx
+            .accounts
+            .tournament
+            .current_entrants
+            .checked_add(1)
+            .ok_or(TourneyError::Overflow)?;
+
+        Ok(())
+    }
+
+    /// Submit a score update for a player during the tournament.
+    pub fn submit_score(
+        ctx: Context<SubmitScore>,
+        score: u64,
+    ) -> Result<()> {
+        let t = &ctx.accounts.tournament;
+        let now = Clock::get()?.unix_timestamp;
+        require!(now < t.end_ts, TourneyError::AlreadyEnded);
+
+        ctx.accounts.entry.score = score;
+        Ok(())
+    }
+
+    /// Finalize the tournament and set final ranks for prize winners.
+    /// In production this is called by the Clockwork/Helius automation thread.
+    pub fn finalize_tournament(
+        ctx: Context<FinalizeTournament>,
+        ranked_players: Vec<Pubkey>,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.creator.key() == ctx.accounts.tournament.creator
+                || ctx.accounts.creator.key() == ctx.accounts.tournament.game,
+            TourneyError::Unauthorized
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+        require!(now >= ctx.accounts.tournament.end_ts, TourneyError::NotEnded);
+
+        ctx.accounts.tournament.is_finalized = true;
+
+        emit!(TournamentFinalized {
+            tournament: ctx.accounts.tournament.key(),
+            winners:    ranked_players,
+        });
+
+        Ok(())
+    }
+
+    /// Claim a prize after tournament finalization.
+    pub fn claim_prize(ctx: Context<ClaimPrize>) -> Result<()> {
+        let entry = &ctx.accounts.entry;
+        let t     = &ctx.accounts.tournament;
+
+        require!(t.is_finalized, TourneyError::NotFinalized);
+        require!(!entry.claimed, TourneyError::AlreadyClaimed);
+
+        let rank = entry.final_rank as usize;
+	require!(rank > 0 && rank <= t.num_prize_tiers as usize, TourneyError::NoPrize);
+        let share_bps = t.prize_shares[rank - 1] as u64;
+        let prize = t
+            .prize_pool
+            .checked_mul(share_bps)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(TourneyError::Overflow)?;
+
+        let tourney_key = t.key();
+        let mint_key    = t.mint;
+        let vault_bump  = t.vault_bump;
+
+        let seeds: &[&[&[u8]]] = &[&[
+            b"prize_vault",
+            tourney_key.as_ref(),
+            mint_key.as_ref(),
+            &[vault_bump],
+        ]];
+
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from:      ctx.accounts.prize_vault.to_account_info(),
+                    to:        ctx.accounts.player_token_account.to_account_info(),
+                    authority: ctx.accounts.prize_vault.to_account_info(),
+                },
+                seeds,
+            ),
+            prize,
+        )?;
+
+        ctx.accounts.entry.claimed = true;
+
+        emit!(PrizeClaimed {
+            player: ctx.accounts.player.key(),
+            tournament: tourney_key,
+            amount: prize,
+            rank:   rank as u32,
+        });
+
+        Ok(())
+    }
+}
+
+// ─── Params ───────────────────────────────────────────────────────────────────
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct CreateTournamentParams {
+    pub name:          String,
+    pub entry_fee:     u64,
+    pub prize_pool:    u64,
+    pub max_entrants:  u32,
+    pub start_ts:      i64,
+    pub end_ts:        i64,
+    pub prize_shares:  Vec<u16>,
+}
+
+// ─── Account contexts ─────────────────────────────────────────────────────────
+
+#[derive(Accounts)]
+#[instruction(params: CreateTournamentParams)]
+pub struct CreateTournament<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    /// CHECK: game account validated by constraint
+    pub game: UncheckedAccount<'info>,
+
+    pub mint: Account<'info, anchor_spl::token::Mint>,
+
+    #[account(
+        init,
+        payer = creator,
+        space = Tournament::LEN,
+        seeds = [b"tournament", creator.key().as_ref(), game.key().as_ref(), mint.key().as_ref()], params.name.as_bytes()],
+        bump,
+    )]
+    pub tournament: Account<'info, Tournament>,
+
+    #[account(
+        init,
+        payer             = creator,
+        token::mint       = mint,
+        token::authority  = prize_vault,
+        seeds = [b"prize_vault", tournament.key().as_ref(), mint.key().as_ref()],
+        bump,
+    )]
+    pub prize_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        token::mint      = mint,
+        token::authority = creator,
+    )]
+    pub creator_token_account: Account<'info, TokenAccount>,
+
+    pub token_program:  Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent:           Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct EnterTournament<'info> {
+    #[account(mut)]
+    pub player: Signer<'info>,
+
+    #[account(mut)]
+    pub tournament: Account<'info, Tournament>,
+
+    #[account(
+        init,
+        payer = player,
+        space = TournamentEntry::LEN,
+        seeds = [b"entry", tournament.key().as_ref(), player.key().as_ref()],
+        bump,
+    )]
+    pub entry: Account<'info, TournamentEntry>,
+
+    #[account(
+        mut,
+        seeds = [b"prize_vault", tournament.key().as_ref(), tournament.mint.as_ref()],
+        bump  = tournament.vault_bump,
+    )]
+    pub prize_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        token::mint      = tournament.mint,
+        token::authority = player,
+    )]
+    pub player_token_account: Account<'info, TokenAccount>,
+
+    pub token_program:  Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SubmitScore<'info> {
+    pub player: Signer<'info>,
+
+    pub tournament: Account<'info, Tournament>,
+
+    #[account(
+        mut,
+        seeds = [b"entry", tournament.key().as_ref(), player.key().as_ref()],
+        bump  = entry.bump,
+        constraint = entry.player == player.key(),
+    )]
+    pub entry: Account<'info, TournamentEntry>,
+}
+
+#[derive(Accounts)]
+pub struct FinalizeTournament<'info> {
+    pub creator: Signer<'info>,
+
+    #[account(mut)]
+    pub tournament: Account<'info, Tournament>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimPrize<'info> {
+    pub player: Signer<'info>,
+
+    pub tournament: Account<'info, Tournament>,
+
+    #[account(
+        mut,
+        seeds = [b"entry", tournament.key().as_ref(), player.key().as_ref()],
+        bump  = entry.bump,
+        constraint = entry.player == player.key(),
+    )]
+    pub entry: Account<'info, TournamentEntry>,
+
+    #[account(
+        mut,
+        seeds = [b"prize_vault", tournament.key().as_ref(), tournament.mint.as_ref()],
+        bump  = tournament.vault_bump,
+    )]
+    pub prize_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        token::mint      = tournament.mint,
+        token::authority = player,
+    )]
+    pub player_token_account: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+// ─── Events ───────────────────────────────────────────────────────────────────
+
+#[event]
+pub struct TournamentCreated {
+    pub tournament: Pubkey,
+    pub game:       Pubkey,
+    pub prize_pool: u64,
+}
+
+#[event]
+pub struct TournamentFinalized {
+    pub tournament: Pubkey,
+    pub winners:    Vec<Pubkey>,
+}
+
+#[event]
+pub struct PrizeClaimed {
+    pub player:     Pubkey,
+    pub tournament: Pubkey,
+    pub amount:     u64,
+    pub rank:       u32,
+}

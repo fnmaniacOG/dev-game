@@ -1,0 +1,580 @@
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+
+declare_id!("GameStat1111111111111111111111111111111111");
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+pub const MAX_HOUSE_EDGE_BPS: u16    = 2_000;  // 20% hard cap
+pub const MIN_SKILL_REWARD_BPS: u16  = 0;      // ponzi games exempt
+pub const EV_PLUS_THRESHOLD_BPS: u16 = 8_000;  // skill + tournament >= 80% for EV+ games
+pub const MAX_NAME_LEN: usize        = 64;
+pub const STAKING_EPOCH_SECONDS: i64 = 7 * 24 * 60 * 60; // 7 days
+
+#[error_code]
+pub enum GameError {
+    #[msg("House edge exceeds maximum (20%)")]
+    HouseEdgeTooHigh,
+    #[msg("EV+ constraint violated: skill_reward + tournament_pool must be >= 80%")]
+    EvConstraintViolated,
+    #[msg("Player already joined this game")]
+    AlreadyJoined,
+    #[msg("Insufficient balance")]
+    InsufficientBalance,
+    #[msg("Game is paused")]
+    GamePaused,
+    #[msg("Only the game creator can call this")]
+    Unauthorized,
+    #[msg("Invalid stake amount")]
+    InvalidStake,
+    #[msg("No yield to claim yet")]
+    NoYield,
+    #[msg("Arithmetic overflow")]
+    Overflow,
+    #[msg("Game name too long")]
+    NameTooLong,
+}
+
+// ─── State ────────────────────────────────────────────────────────────────────
+
+#[account]
+pub struct Game {
+    pub creator:             Pubkey,
+    pub mint:                Pubkey,
+    pub reward_vault:        Pubkey,    // PDA holding player reward tokens
+    pub name:                [u8; 64],    // max 64 chars
+    pub house_edge_bps:      u16,       // <= 2000
+    pub skill_reward_bps:    u16,       // % of pool paid to skill/win
+    pub tournament_pool_bps: u16,       // % of pool reserved for tournaments
+    pub is_ponzi:            bool,      // ponzi games exempt from EV+ check
+    pub is_paused:           bool,
+    pub total_players:       u64,
+    pub total_raids:         u64,
+    pub total_rewards_paid:  u64,
+    pub created_at:          i64,
+    pub bump:                u8,
+    pub vault_bump:          u8,
+}
+
+impl Game {
+    pub const LEN: usize = 8
+        + 32 * 3          // creator, mint, reward_vault
+        + 64 // name string
+        + 2 * 3           // bps fields
+        + 1 + 1           // flags
+        + 8 * 3           // counters
+        + 8               // created_at
+        + 1 + 1;          // bumps
+}
+
+#[account]
+pub struct Player {
+    pub wallet:          Pubkey,
+    pub game:            Pubkey,
+    pub level:           u8,
+    pub xp:              u64,
+    pub xp_to_next:      u64,
+    pub total_raids:     u64,
+    pub wins:            u64,
+    pub total_earned:    u64,
+    pub staked_amount:   u64,
+    pub stake_epoch:     i64,   // when they last staked/claimed
+    pub nft_rarity:      u8,    // 0=none, 1=common, 2=rare, 3=epic, 4=legendary
+    pub joined_at:       i64,
+    pub bump:            u8,
+}
+
+impl Player {
+    pub const LEN: usize = 8
+        + 32 * 2          // wallet, game
+        + 1               // level
+        + 8 * 6           // xp, xp_to_next, raids, wins, earned, staked
+        + 8               // stake_epoch
+        + 1               // nft_rarity
+        + 8               // joined_at
+        + 1;              // bump
+}
+
+// ─── Program ──────────────────────────────────────────────────────────────────
+
+#[program]
+pub mod game_state {
+    use super::*;
+
+    /// Register a new game. Enforces EV+ constraints unless flagged as ponzi.
+    pub fn register_game(
+        ctx: Context<RegisterGame>,
+        params: RegisterGameParams,
+    ) -> Result<()> {
+        require!(params.name.len() <= MAX_NAME_LEN, GameError::NameTooLong);
+        require!(
+            params.house_edge_bps <= MAX_HOUSE_EDGE_BPS,
+            GameError::HouseEdgeTooHigh
+        );
+
+        // EV+ enforcement: non-ponzi games must route >= 80% to skill + tournament
+        if !params.is_ponzi {
+            let ev_sum = (params.skill_reward_bps as u32)
+                .checked_add(params.tournament_pool_bps as u32)
+                .ok_or(GameError::Overflow)?;
+            require!(
+                ev_sum >= EV_PLUS_THRESHOLD_BPS as u32,
+                GameError::EvConstraintViolated
+            );
+        }
+
+        let game = &mut ctx.accounts.game;
+        game.creator             = ctx.accounts.creator.key();
+        game.mint                = ctx.accounts.mint.key();
+        game.reward_vault        = ctx.accounts.reward_vault.key();
+        let nb = params.name.as_bytes();
+        let nc = nb.len().min(64);
+        game.name[..nc].copy_from_slice(&nb[..nc]);
+        game.house_edge_bps      = params.house_edge_bps;
+        game.skill_reward_bps    = params.skill_reward_bps;
+        game.tournament_pool_bps = params.tournament_pool_bps;
+        game.is_ponzi            = params.is_ponzi;
+        game.is_paused           = false;
+        game.total_players       = 0;
+        game.total_raids         = 0;
+        game.total_rewards_paid  = 0;
+        game.created_at          = Clock::get()?.unix_timestamp;
+        game.bump                = ctx.bumps.game;
+        game.vault_bump          = ctx.bumps.reward_vault;
+
+        emit!(GameRegistered {
+            creator:    ctx.accounts.creator.key(),
+            game:       ctx.accounts.game.key(),
+            mint:       ctx.accounts.mint.key(),
+            house_edge: params.house_edge_bps,
+        });
+
+        Ok(())
+    }
+
+    /// Create a player account for the connected wallet in this game.
+    pub fn join_game(ctx: Context<JoinGame>) -> Result<()> {
+        require!(!ctx.accounts.game.is_paused, GameError::GamePaused);
+
+        let player = &mut ctx.accounts.player;
+        player.wallet       = ctx.accounts.wallet.key();
+        player.game         = ctx.accounts.game.key();
+        player.level        = 1;
+        player.xp           = 0;
+        player.xp_to_next   = 100;
+        player.total_raids  = 0;
+        player.wins         = 0;
+        player.total_earned = 0;
+        player.staked_amount = 0;
+        player.stake_epoch  = 0;
+        player.nft_rarity   = 0;
+        player.joined_at    = Clock::get()?.unix_timestamp;
+        player.bump         = ctx.bumps.player;
+
+        let game = &mut ctx.accounts.game;
+        game.total_players = game.total_players.checked_add(1).ok_or(GameError::Overflow)?;
+
+        emit!(PlayerJoined {
+            wallet: ctx.accounts.wallet.key(),
+            game:   ctx.accounts.game.key(),
+        });
+
+        Ok(())
+    }
+
+    /// Execute a raid outcome. Called by the game client with VRF-derived result.
+    /// On mainnet, this is called by the vrf_consumer settle_raid instruction.
+    pub fn execute_raid(
+        ctx: Context<ExecuteRaid>,
+        won: bool,
+        xp_gained: u64,
+        reward_amount: u64,
+    ) -> Result<()> {
+        require!(!ctx.accounts.game.is_paused, GameError::GamePaused);
+
+        let player = &mut ctx.accounts.player;
+        let game   = &mut ctx.accounts.game;
+
+        player.total_raids = player.total_raids.checked_add(1).ok_or(GameError::Overflow)?;
+        game.total_raids   = game.total_raids.checked_add(1).ok_or(GameError::Overflow)?;
+
+        if won {
+            player.wins = player.wins.checked_add(1).ok_or(GameError::Overflow)?;
+            player.total_earned = player
+                .total_earned
+                .checked_add(reward_amount)
+                .ok_or(GameError::Overflow)?;
+            game.total_rewards_paid = game
+                .total_rewards_paid
+                .checked_add(reward_amount)
+                .ok_or(GameError::Overflow)?;
+
+            // Transfer reward from vault to player
+            if reward_amount > 0 {
+                let game_key    = game.key();
+                let mint_key    = game.mint;
+                let vault_bump  = game.vault_bump;
+                let seeds: &[&[&[u8]]] = &[&[
+                    b"reward_vault",
+                    game_key.as_ref(),
+                    mint_key.as_ref(),
+                    &[vault_bump],
+                ]];
+                token::transfer(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        Transfer {
+                            from:      ctx.accounts.reward_vault.to_account_info(),
+                            to:        ctx.accounts.player_token_account.to_account_info(),
+                            authority: ctx.accounts.reward_vault.to_account_info(),
+                        },
+                        seeds,
+                    ),
+                    reward_amount,
+                )?;
+            }
+        }
+
+        // XP + level up
+        player.xp = player.xp.checked_add(xp_gained).ok_or(GameError::Overflow)?;
+        while player.xp >= player.xp_to_next && player.level < 100 {
+            player.xp -= player.xp_to_next;
+            player.level += 1;
+            player.xp_to_next = player.xp_to_next
+                .checked_mul(12)
+                .and_then(|v| v.checked_div(10))
+                .ok_or(GameError::Overflow)?; // 1.2x each level
+        }
+
+        emit!(RaidExecuted {
+            wallet:  ctx.accounts.wallet.key(),
+            game:    game.key(),
+            won,
+            reward:  reward_amount,
+            level:   player.level,
+        });
+
+        Ok(())
+    }
+
+    /// Stake tokens to earn yield over time.
+    pub fn stake_tokens(ctx: Context<StakeTokens>, amount: u64) -> Result<()> {
+        require!(amount > 0, GameError::InvalidStake);
+        require!(!ctx.accounts.game.is_paused, GameError::GamePaused);
+
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from:      ctx.accounts.player_token_account.to_account_info(),
+                    to:        ctx.accounts.stake_vault.to_account_info(),
+                    authority: ctx.accounts.wallet.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+
+        let player = &mut ctx.accounts.player;
+        player.staked_amount = player
+            .staked_amount
+            .checked_add(amount)
+            .ok_or(GameError::Overflow)?;
+        player.stake_epoch = Clock::get()?.unix_timestamp;
+
+        Ok(())
+    }
+
+    /// Claim accumulated staking yield (5% APY per 7-day epoch, scaled by NFT rarity).
+    pub fn claim_stake_yield(ctx: Context<ClaimStakeYield>) -> Result<()> {
+        let player = &ctx.accounts.player;
+        require!(player.staked_amount > 0, GameError::InvalidStake);
+
+        let now = Clock::get()?.unix_timestamp;
+        let elapsed = now.checked_sub(player.stake_epoch).ok_or(GameError::Overflow)?;
+        let epochs = elapsed / STAKING_EPOCH_SECONDS;
+        require!(epochs > 0, GameError::NoYield);
+
+        // Base 5% APY = 0.096% per 7-day epoch
+        // NFT multiplier: common 1x, rare 1.25x, epic 1.5x, legendary 2x
+        let nft_mult_bps: u64 = match player.nft_rarity {
+            1 => 10_000,
+            2 => 12_500,
+            3 => 15_000,
+            4 => 20_000,
+            _ => 10_000,
+        };
+
+        let yield_per_epoch_bps: u64 = 96; // 0.96% per epoch = ~5% APY
+        let yield_amount = player
+            .staked_amount
+            .checked_mul(yield_per_epoch_bps)
+            .and_then(|v| v.checked_mul(nft_mult_bps))
+            .and_then(|v| v.checked_div(10_000 * 10_000))
+            .and_then(|v| v.checked_mul(epochs as u64))
+            .ok_or(GameError::Overflow)?;
+
+        let game_key   = ctx.accounts.game.key();
+        let mint_key   = ctx.accounts.game.mint;
+        let vault_bump = ctx.accounts.game.vault_bump;
+        let seeds: &[&[&[u8]]] = &[&[
+            b"reward_vault",
+            game_key.as_ref(),
+            mint_key.as_ref(),
+            &[vault_bump],
+        ]];
+
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from:      ctx.accounts.reward_vault.to_account_info(),
+                    to:        ctx.accounts.player_token_account.to_account_info(),
+                    authority: ctx.accounts.reward_vault.to_account_info(),
+                },
+                seeds,
+            ),
+            yield_amount,
+        )?;
+
+        let player = &mut ctx.accounts.player;
+        player.total_earned = player
+            .total_earned
+            .checked_add(yield_amount)
+            .ok_or(GameError::Overflow)?;
+        player.stake_epoch = now;
+
+        Ok(())
+    }
+
+    /// Pause or unpause a game. Only the creator can call this.
+    pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
+        require!(
+            ctx.accounts.creator.key() == ctx.accounts.game.creator,
+            GameError::Unauthorized
+        );
+        ctx.accounts.game.is_paused = paused;
+        Ok(())
+    }
+
+    /// Update NFT rarity for a player (called by the NFT verification oracle).
+    pub fn update_nft_rarity(ctx: Context<UpdateNftRarity>, rarity: u8) -> Result<()> {
+        require!(rarity <= 4, GameError::InvalidStake);
+        ctx.accounts.player.nft_rarity = rarity;
+        Ok(())
+    }
+}
+
+// ─── Instruction params ───────────────────────────────────────────────────────
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct RegisterGameParams {
+    pub name:                String,
+    pub house_edge_bps:      u16,
+    pub skill_reward_bps:    u16,
+    pub tournament_pool_bps: u16,
+    pub is_ponzi:            bool,
+}
+
+// ─── Account contexts ─────────────────────────────────────────────────────────
+
+#[derive(Accounts)]
+#[instruction(params: RegisterGameParams)]
+pub struct RegisterGame<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    pub mint: Account<'info, anchor_spl::token::Mint>,
+
+    #[account(
+        init,
+        payer = creator,
+        space = Game::LEN,
+        seeds = [b"game", creator.key().as_ref(), mint.key().as_ref()],
+        bump,
+    )]
+    pub game: Account<'info, Game>,
+
+    /// PDA token account for player reward pool
+    #[account(
+        init,
+        payer             = creator,
+        token::mint       = mint,
+        token::authority  = reward_vault,
+        seeds = [b"reward_vault", game.key().as_ref(), mint.key().as_ref()],
+        bump,
+    )]
+    pub reward_vault: Account<'info, TokenAccount>,
+
+    pub token_program:  Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent:           Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct JoinGame<'info> {
+    #[account(mut)]
+    pub wallet: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"game", game.creator.as_ref(), game.mint.as_ref()],
+        bump  = game.bump,
+    )]
+    pub game: Account<'info, Game>,
+
+    #[account(
+        init,
+        payer = wallet,
+        space = Player::LEN,
+        seeds = [b"player", game.key().as_ref(), wallet.key().as_ref()],
+        bump,
+    )]
+    pub player: Account<'info, Player>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteRaid<'info> {
+    pub wallet: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"game", game.creator.as_ref(), game.mint.as_ref()],
+        bump  = game.bump,
+    )]
+    pub game: Account<'info, Game>,
+
+    #[account(
+        mut,
+        seeds = [b"player", game.key().as_ref(), wallet.key().as_ref()],
+        bump  = player.bump,
+        constraint = player.wallet == wallet.key(),
+    )]
+    pub player: Account<'info, Player>,
+
+    #[account(
+        mut,
+        seeds = [b"reward_vault", game.key().as_ref(), game.mint.as_ref()],
+        bump  = game.vault_bump,
+    )]
+    pub reward_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        token::mint      = game.mint,
+        token::authority = wallet,
+    )]
+    pub player_token_account: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct StakeTokens<'info> {
+    pub wallet: Signer<'info>,
+
+    pub game: Account<'info, Game>,
+
+    #[account(
+        mut,
+        seeds = [b"player", game.key().as_ref(), wallet.key().as_ref()],
+        bump  = player.bump,
+        constraint = player.wallet == wallet.key(),
+    )]
+    pub player: Account<'info, Player>,
+
+    #[account(
+        mut,
+        token::mint      = game.mint,
+        token::authority = wallet,
+    )]
+    pub player_token_account: Account<'info, TokenAccount>,
+
+    /// CHECK: PDA stake vault — validated by seeds
+    #[account(mut)]
+    pub stake_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimStakeYield<'info> {
+    pub wallet: Signer<'info>,
+
+    pub game: Account<'info, Game>,
+
+    #[account(
+        mut,
+        seeds = [b"player", game.key().as_ref(), wallet.key().as_ref()],
+        bump  = player.bump,
+        constraint = player.wallet == wallet.key(),
+    )]
+    pub player: Account<'info, Player>,
+
+    #[account(
+        mut,
+        seeds = [b"reward_vault", game.key().as_ref(), game.mint.as_ref()],
+        bump  = game.vault_bump,
+    )]
+    pub reward_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        token::mint      = game.mint,
+        token::authority = wallet,
+    )]
+    pub player_token_account: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct SetPaused<'info> {
+    pub creator: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"game", game.creator.as_ref(), game.mint.as_ref()],
+        bump  = game.bump,
+    )]
+    pub game: Account<'info, Game>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateNftRarity<'info> {
+    pub authority: Signer<'info>, // oracle or game creator
+
+    pub game: Account<'info, Game>,
+
+    #[account(
+        mut,
+        seeds = [b"player", game.key().as_ref(), player.wallet.as_ref()],
+        bump  = player.bump,
+    )]
+    pub player: Account<'info, Player>,
+}
+
+// ─── Events ───────────────────────────────────────────────────────────────────
+
+#[event]
+pub struct GameRegistered {
+    pub creator:    Pubkey,
+    pub game:       Pubkey,
+    pub mint:       Pubkey,
+    pub house_edge: u16,
+}
+
+#[event]
+pub struct PlayerJoined {
+    pub wallet: Pubkey,
+    pub game:   Pubkey,
+}
+
+#[event]
+pub struct RaidExecuted {
+    pub wallet: Pubkey,
+    pub game:   Pubkey,
+    pub won:    bool,
+    pub reward: u64,
+    pub level:  u8,
+}

@@ -1,0 +1,31 @@
+.env*.local
+
+# Build artifacts
+target/
+
+# Solana keypairs (contain private keys)
+*-keypair.json
+deploy/*.json
+
+# Keep these JSON files
+!package.json
+!tsconfig.json
+!anchor.json
+
+# Node
+node_modules/
+.next/
+
+# OS
+.DS_Store
+
+# Dependencies
+app/node_modules/
+node_modules/
+
+# Cargo lock (optional for apps)
+# Cargo.lock
+
+# Next.js
+app/.next/
+app/out/

@@ -1,4 +1,4 @@
-# game.tok
+# devgame
 
 **The first AI-powered game launchpad on Solana.**  
 Launch games. Launch tokens. Win together.
@@ -7,7 +7,7 @@ Launch games. Launch tokens. Win together.
 
 ## What this is
 
-game.tok lets anyone deploy a blockchain game with its own token economy in minutes. Every game gets:
+devgame lets anyone deploy a blockchain game with its own token economy in minutes. Every game gets:
 - A fungible token (FT) and/or NFT collection minted on Solana
 - Locked liquidity (no rug pulls — enforced on-chain)
 - An AI-designed game loop and tokenomics

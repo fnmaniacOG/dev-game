@@ -19,7 +19,7 @@ devgame lets anyone deploy a blockchain game with its own token economy in minut
 ## Project structure
 
 ```
-game-tok/
+dev-game/
 ├── programs/
 │   ├── token_factory/      Mint FT + NFT collections (Anchor/Rust)
 │   ├── liquidity_lock/     Lock LP tokens immutably at launch (Anchor/Rust)
@@ -28,7 +28,7 @@ game-tok/
 │   └── src/
 │       ├── pages/          Next.js pages (index, API routes)
 │       ├── components/     ExplorePanel, LaunchPanel, PortfolioPanel, GameDetail
-│       ├── lib/            GameTokClient SDK, types
+│       ├── lib/            DevGameClient SDK, types
 │       └── styles/         Global CSS (orange design system)
 ├── tests/                  Anchor test suite (TypeScript)
 ├── scripts/                deploy.ts
@@ -96,7 +96,7 @@ npx ts-node scripts/deploy.ts --cluster devnet
 - EV+ enforcement: skill_reward_bps + tournament_pool_bps must be ≥ 8,000
 - Mint authority revoked immediately after initial supply mint
 - Pseudo-RNG (slot hash) for devnet — **replace with Switchboard VRF before mainnet**
-- Full test suite in `tests/game_tok.ts` covering error cases
+- Full test suite in `tests/dev_game.ts` covering error cases
 
 See `docs/AUDIT_AND_DEPLOYMENT.md` for audit firm contacts, timeline, and mainnet checklist.
 
